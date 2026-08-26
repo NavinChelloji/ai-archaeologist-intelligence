@@ -1,5 +1,6 @@
 import "reflect-metadata";
 import { config } from "dotenv";
+import { randomUUID } from "node:crypto";
 import { NestFactory } from "@nestjs/core";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
 import { AppModule } from "./app.module";
@@ -7,11 +8,38 @@ import { loadAiEnv } from "./config/env";
 
 config();
 
-async function bootstrap(): Promise<void> {
-  const env = loadAiEnv();
+const CORRELATION_ID_HEADER = "x-correlation-id";
 
+/**
+ * `ai` embeds and retrieves in bursty, CPU/IO-heavy batches (embedding a
+ * freshly imported repo) alongside steady low-latency retrieval reads, so
+ * the same build runs as either an HTTP instance or a queue worker — "same
+ * build, different startup command, different scaling policy"
+ * (WORKSPACE_AND_PACKAGE_STRATEGY.md), matching the indexer's `main.ts`.
+ * Job subscriptions start in both roles; only the HTTP listener is
+ * role-gated.
+ */
+const isWorker = process.argv.includes("--role=worker");
+
+async function bootstrap(): Promise<void> {
+  if (isWorker) {
+    const app = await NestFactory.createApplicationContext(AppModule, { bufferLogs: true });
+    app.enableShutdownHooks();
+    // eslint-disable-next-line no-console
+    console.log("ai worker started (no HTTP listener)");
+    return;
+  }
+
+  const env = loadAiEnv();
   const app = await NestFactory.create<NestFastifyApplication>(AppModule, new FastifyAdapter(), {
     bufferLogs: true,
+  });
+
+  const fastify = app.getHttpAdapter().getInstance();
+  fastify.addHook("onRequest", async (request, reply) => {
+    const header = request.headers[CORRELATION_ID_HEADER];
+    request.correlationId = typeof header === "string" && header.length > 0 ? header : randomUUID();
+    reply.header(CORRELATION_ID_HEADER, request.correlationId);
   });
 
   app.enableShutdownHooks();
