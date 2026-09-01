@@ -83,4 +83,9 @@ export class ChatConversationsRepository {
   async softDelete(id: string, userId: string): Promise<void> {
     await query(this.pool, `UPDATE chat_conversations SET deleted_at = now() WHERE id = $1 AND user_id = $2`, [id, userId]);
   }
+
+  /** `repo.deleted` cleanup (DATA_RETENTION_AND_PRIVACY.md "ai deletes ... conversations, and messages for the repository") — hard delete, cascading to `chat_messages`. Idempotent. */
+  async deleteByRepoId(repoId: string): Promise<void> {
+    await query(this.pool, `DELETE FROM chat_conversations WHERE repo_id = $1`, [repoId]);
+  }
 }
