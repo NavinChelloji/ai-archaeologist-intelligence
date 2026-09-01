@@ -55,4 +55,27 @@ export class SnapshotChunksRepository {
     ]);
     return Number(rows[0]?.count ?? "0");
   }
+
+  /**
+   * `snapshot.prune` cleanup, first half: removes links to snapshots
+   * `indexer` no longer retains for this repo. `ai` has no snapshots table
+   * of its own, so `validSnapshotIds` (fetched from `indexer`) is the only
+   * source of truth for "still valid" here. An empty `validSnapshotIds`
+   * removes every link for the repo, which is correct if `indexer` retains
+   * nothing. Scoped to the repo via a join through `code_chunks`, since this
+   * table carries no `repo_id` of its own.
+   */
+  async deleteForRepoNotIn(repoId: string, validSnapshotIds: string[]): Promise<number> {
+    const rows = await query<{ chunk_id: string }>(
+      this.pool,
+      `DELETE FROM snapshot_chunks sc
+       USING code_chunks cc
+       WHERE sc.chunk_id = cc.id
+       AND cc.repo_id = $1
+       AND sc.snapshot_id != ALL($2::uuid[])
+       RETURNING sc.chunk_id`,
+      [repoId, validSnapshotIds]
+    );
+    return rows.length;
+  }
 }

@@ -82,4 +82,9 @@ export class EmbeddingRunsRepository {
     );
     return rows[0] ?? null;
   }
+
+  /** `repo.deleted` cleanup — internal telemetry, not user data, but still repo-scoped and must not outlive the repository. Idempotent. */
+  async deleteByRepoId(repoId: string): Promise<void> {
+    await query(this.pool, "DELETE FROM embedding_runs WHERE repo_id = $1", [repoId]);
+  }
 }

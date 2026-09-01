@@ -161,6 +161,31 @@ export class CodeChunksRepository {
     );
   }
 
+  /** `repo.deleted` cleanup (DATA_RETENTION_AND_PRIVACY.md "ai deletes snapshot_chunks, orphaned code_chunks ... for the repository") — cascades to `snapshot_chunks` via its `chunk_id` FK. Idempotent. */
+  async deleteByRepoId(repoId: string): Promise<void> {
+    await query(this.pool, "DELETE FROM code_chunks WHERE repo_id = $1", [repoId]);
+  }
+
+  /**
+   * `snapshot.prune` cleanup, second half: after `snapshot_chunks` rows for
+   * pruned snapshots are gone, a chunk with zero remaining links is no
+   * longer referenced by any retained snapshot and can be removed
+   * (DATA_RETENTION_AND_PRIVACY.md "pruning a snapshot deletes only the
+   * chunks no remaining snapshot still references"). Returns the count
+   * removed for the handler's log line.
+   */
+  async deleteOrphaned(repoId: string): Promise<number> {
+    const rows = await query<{ id: string }>(
+      this.pool,
+      `DELETE FROM code_chunks cc
+       WHERE cc.repo_id = $1
+       AND NOT EXISTS (SELECT 1 FROM snapshot_chunks sc WHERE sc.chunk_id = cc.id)
+       RETURNING cc.id`,
+      [repoId]
+    );
+    return rows.length;
+  }
+
   private appendFilterConditions(conditions: string[], values: unknown[], filters?: RetrievalFilterInput): void {
     if (filters?.pathPrefix) {
       const escaped = filters.pathPrefix.replace(/[\\%_]/g, "\\$&");

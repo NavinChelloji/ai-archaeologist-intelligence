@@ -1,6 +1,7 @@
 import { Module } from "@nestjs/common";
 import { ConfigModule } from "../../config/config.module";
 import { InternalModule } from "../../internal/internal.module";
+import { UsageModule } from "../usage/usage.module";
 import { CodeChunksRepository } from "./code-chunks.repository";
 import { EmbeddingRunsRepository } from "./embedding-runs.repository";
 import { EMBEDDING_PROVIDER } from "./embedding/embedding-provider";
@@ -13,7 +14,7 @@ import { SnapshotChunksRepository } from "./snapshot-chunks.repository";
 import { RetrievalWorkersService } from "./workers/retrieval-workers.service";
 
 @Module({
-  imports: [ConfigModule, InternalModule],
+  imports: [ConfigModule, InternalModule, UsageModule],
   controllers: [RetrievalInternalController],
   providers: [
     { provide: EMBEDDING_PROVIDER, useClass: TransformersEmbeddingProvider },
@@ -25,6 +26,6 @@ import { RetrievalWorkersService } from "./workers/retrieval-workers.service";
     RetrievalReadService,
     RetrievalWorkersService,
   ],
-  exports: [RetrievalReadService],
+  exports: [RetrievalReadService, CodeChunksRepository, SnapshotChunksRepository, EmbeddingRunsRepository],
 })
 export class RetrievalModule {}

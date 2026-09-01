@@ -127,6 +127,22 @@ function fakeEmbeddingRunsRepository() {
   return { upsertRunning: vi.fn(async () => undefined), markCompleted: vi.fn(async () => undefined), markFailed: vi.fn(async () => undefined), findBySnapshotId: vi.fn() };
 }
 
+function fakeTokenUsageRepository(usedTokens = 0) {
+  return {
+    sumTokensForUserThisMonth: vi.fn(async () => usedTokens),
+    insert: vi.fn(async () => undefined),
+    anonymizeUser: vi.fn(async () => undefined),
+  };
+}
+
+function fakeProviderMetrics() {
+  return {
+    providerErrorsTotal: { inc: vi.fn() },
+    embeddingDurationSeconds: { observe: vi.fn() },
+    chatLatencySeconds: { observe: vi.fn() },
+  };
+}
+
 function fakeEmbeddingProvider(): EmbeddingProvider & { embedBatch: ReturnType<typeof vi.fn> } {
   return {
     model: "fake-model",
@@ -140,7 +156,13 @@ function fakeLogger() {
 }
 
 function config(): AiEnv {
-  return { CHUNK_MAX_TOKENS: 512, CHUNK_OVERLAP_TOKENS: 64, EMBEDDING_BATCH_SIZE: 96, EMBEDDING_CONCURRENCY: 4 } as AiEnv;
+  return {
+    CHUNK_MAX_TOKENS: 512,
+    CHUNK_OVERLAP_TOKENS: 64,
+    EMBEDDING_BATCH_SIZE: 96,
+    EMBEDDING_CONCURRENCY: 4,
+    QUOTA_EMBEDDING_TOKENS_PER_MONTH: 2000000,
+  } as AiEnv;
 }
 
 function buildService(opts: {
@@ -148,6 +170,7 @@ function buildService(opts: {
   contents: Record<string, string>;
   codeChunksSeed?: CodeChunkRow[];
   snapshotChunksSeed?: SnapshotChunkRow[];
+  usedEmbeddingTokens?: number;
 }) {
   const boss = { send: vi.fn().mockResolvedValue("job-1") };
   const manifestReader = fakeManifestReader(opts.manifests, opts.contents);
@@ -155,6 +178,8 @@ function buildService(opts: {
   const snapshotChunks = fakeSnapshotChunksRepository(opts.snapshotChunksSeed);
   const embeddingRuns = fakeEmbeddingRunsRepository();
   const embeddingProvider = fakeEmbeddingProvider();
+  const tokenUsage = fakeTokenUsageRepository(opts.usedEmbeddingTokens ?? 0);
+  const providerMetrics = fakeProviderMetrics();
   const logger = fakeLogger();
 
   const service = new IndexingService(
@@ -162,13 +187,15 @@ function buildService(opts: {
     config(),
     logger as never,
     embeddingProvider,
+    providerMetrics as never,
     manifestReader as never,
     codeChunks as never,
     snapshotChunks as never,
-    embeddingRuns as never
+    embeddingRuns as never,
+    tokenUsage as never
   );
 
-  return { service, boss, manifestReader, codeChunks, snapshotChunks, embeddingRuns, embeddingProvider, logger };
+  return { service, boss, manifestReader, codeChunks, snapshotChunks, embeddingRuns, embeddingProvider, tokenUsage, providerMetrics, logger };
 }
 
 describe("IndexingService.handleIndexRequested", () => {
@@ -303,7 +330,7 @@ describe("IndexingService.handleIndexRequested", () => {
     const fileA = fileEntry({ path: "src/a.ts" });
     const newManifestKey = `${REPO_ID}/${NEW_SNAPSHOT_ID}/manifest.json`;
 
-    const { service, embeddingProvider, snapshotChunks } = buildService({
+    const { service, embeddingProvider, snapshotChunks, tokenUsage } = buildService({
       manifests: { [newManifestKey]: manifest([fileA]) },
       contents: { [fileA.objectKey]: "export function hello() { return 'hi'; }" },
     });
@@ -312,5 +339,45 @@ describe("IndexingService.handleIndexRequested", () => {
 
     expect(embeddingProvider.embedBatch).toHaveBeenCalledTimes(1);
     expect(snapshotChunks._rows.filter((r) => r.snapshot_id === NEW_SNAPSHOT_ID).length).toBeGreaterThan(0);
+    expect(tokenUsage.insert).toHaveBeenCalledWith(expect.objectContaining({ userId: USER_ID, repoId: REPO_ID, kind: "embedding" }));
+  });
+
+  it("fails the embedding stage with QUOTA_EMBEDDING_TOKENS instead of embedding when the monthly budget is exhausted", async () => {
+    const fileA = fileEntry({ path: "src/a.ts" });
+    const newManifestKey = `${REPO_ID}/${NEW_SNAPSHOT_ID}/manifest.json`;
+
+    const { service, boss, embeddingProvider, tokenUsage } = buildService({
+      manifests: { [newManifestKey]: manifest([fileA]) },
+      contents: { [fileA.objectKey]: "export function hello() { return 'hi'; }" },
+      usedEmbeddingTokens: 2_000_000,
+    });
+
+    await service.handleIndexRequested(envelope({ manifestKey: newManifestKey, previousSnapshotId: null }));
+
+    expect(embeddingProvider.embedBatch).not.toHaveBeenCalled();
+    expect(tokenUsage.insert).not.toHaveBeenCalled();
+    const failedCall = boss.send.mock.calls.find((c) => c[0] === "repo.stage.failed");
+    expect(failedCall?.[1].payload).toMatchObject({ stage: "embedding", errorCode: "QUOTA_EMBEDDING_TOKENS", retryable: false });
+  });
+
+  it("does not check the embedding quota when re-indexing finds nothing changed to embed", async () => {
+    const fileA = fileEntry({ path: "src/a.ts", contentHash: "sha256:a" });
+    const previousFileA = fileEntry({ fileId: randomUUID(), path: "src/a.ts", contentHash: "sha256:a" });
+    const newManifestKey = `${REPO_ID}/${NEW_SNAPSHOT_ID}/manifest.json`;
+    const previousManifestKey = `${REPO_ID}/${PREVIOUS_SNAPSHOT_ID}/manifest.json`;
+
+    const { service, tokenUsage } = buildService({
+      manifests: {
+        [newManifestKey]: manifest([fileA]),
+        [previousManifestKey]: manifest([previousFileA], PREVIOUS_SNAPSHOT_ID),
+      },
+      contents: {},
+      snapshotChunksSeed: [{ snapshot_id: PREVIOUS_SNAPSHOT_ID, chunk_id: "chunk-a", file_id: previousFileA.fileId }],
+      usedEmbeddingTokens: 2_000_000,
+    });
+
+    await service.handleIndexRequested(envelope({ manifestKey: newManifestKey, previousSnapshotId: PREVIOUS_SNAPSHOT_ID }));
+
+    expect(tokenUsage.sumTokensForUserThisMonth).not.toHaveBeenCalled();
   });
 });

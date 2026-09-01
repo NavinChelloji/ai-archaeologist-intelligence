@@ -5,9 +5,12 @@ import { AppError, type TypedEnvelope } from "@aca/contracts";
 import { publishJob } from "@aca/queue";
 import type { Logger } from "@aca/logger";
 import { manifestObjectKey } from "@aca/storage";
+import type { ProviderMetrics } from "@aca/metrics";
 import { APP_CONFIG } from "../../config/config.module";
 import type { AiEnv } from "../../config/env";
 import { APP_LOGGER, PG_BOSS } from "../../shared/infra.module";
+import { PROVIDER_METRICS } from "../../shared/metrics/metrics.module";
+import { TokenUsageRepository } from "../usage/token-usage.repository";
 import { chunkFile } from "./chunking/chunker";
 import type { ChunkSpec } from "./chunking/chunk-types";
 import { CodeChunksRepository, type InsertCodeChunkInput } from "./code-chunks.repository";
@@ -41,10 +44,12 @@ export class IndexingService {
     @Inject(APP_CONFIG) private readonly config: AiEnv,
     @Inject(APP_LOGGER) private readonly logger: Logger,
     @Inject(EMBEDDING_PROVIDER) private readonly embeddingProvider: EmbeddingProvider,
+    @Inject(PROVIDER_METRICS) private readonly providerMetrics: ProviderMetrics,
     private readonly manifestReader: ManifestReaderService,
     private readonly codeChunks: CodeChunksRepository,
     private readonly snapshotChunks: SnapshotChunksRepository,
-    private readonly embeddingRuns: EmbeddingRunsRepository
+    private readonly embeddingRuns: EmbeddingRunsRepository,
+    private readonly tokenUsage: TokenUsageRepository
   ) {}
 
   async handleIndexRequested(envelope: TypedEnvelope<"repo.index.requested">): Promise<void> {
@@ -66,12 +71,29 @@ export class IndexingService {
         await this.relinkUnchangedFiles(snapshotId, previousManifest.snapshotId, unchangedFiles);
       }
 
+      if (changedFiles.length > 0) {
+        await this.assertEmbeddingQuota(envelope.userId);
+      }
+
       const { embeddedChunks, promptTokens } = await this.chunkAndEmbedChangedFiles(repoId, snapshotId, changedFiles);
+
+      if (promptTokens > 0) {
+        await this.tokenUsage.insert({
+          id: randomUUID(),
+          userId: envelope.userId,
+          repoId,
+          kind: "embedding",
+          model: this.embeddingProvider.model,
+          promptTokens,
+          completionTokens: 0,
+        });
+      }
 
       const totalChunks = await this.snapshotChunks.countBySnapshot(snapshotId);
       const reusedChunks = Math.max(totalChunks - embeddedChunks, 0);
 
       await this.embeddingRuns.markCompleted({ snapshotId, totalChunks, embeddedChunks, reusedChunks, promptTokens });
+      this.providerMetrics.embeddingDurationSeconds.observe((Date.now() - startedAt) / 1000);
 
       await publishJob(this.boss, {
         eventType: "repo.embeddings.completed",
@@ -99,6 +121,14 @@ export class IndexingService {
       this.logger.info({ repoId, snapshotId, totalChunks, embeddedChunks, reusedChunks }, "embedding run completed");
     } catch (err) {
       await this.handleFailure(envelope, repoId, snapshotId, err);
+    }
+  }
+
+  /** RULES.md #18 "Enforce ... quotas ... before making a paid call, not after" — checked only when there's actually something new to embed, since an all-reused run costs nothing. */
+  private async assertEmbeddingQuota(userId: string): Promise<void> {
+    const usedTokens = await this.tokenUsage.sumTokensForUserThisMonth(userId, "embedding");
+    if (usedTokens >= this.config.QUOTA_EMBEDDING_TOKENS_PER_MONTH) {
+      throw new AppError("QUOTA_EMBEDDING_TOKENS", "Monthly embedding token budget exhausted.");
     }
   }
 
@@ -221,6 +251,7 @@ export class IndexingService {
 
     this.logger.error({ err: appError, repoId, snapshotId }, "embedding run failed");
     await this.embeddingRuns.markFailed(snapshotId, appError.code);
+    this.providerMetrics.providerErrorsTotal.inc({ provider: "embedding", kind: appError.code });
 
     await publishJob(this.boss, {
       eventType: "repo.stage.failed",

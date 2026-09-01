@@ -13,9 +13,11 @@ import {
   type MessagesListResponse,
 } from "@aca/contracts";
 import type { Logger } from "@aca/logger";
+import type { ProviderMetrics } from "@aca/metrics";
 import { APP_CONFIG } from "../../config/config.module";
 import type { AiEnv } from "../../config/env";
 import { APP_LOGGER } from "../../shared/infra.module";
+import { PROVIDER_METRICS } from "../../shared/metrics/metrics.module";
 import { RetrievalReadService } from "../retrieval/retrieval-read.service";
 import { ChatConversationsRepository, type ChatConversationRow } from "./chat-conversations.repository";
 import { ChatMessagesRepository, type ChatMessageRow } from "./chat-messages.repository";
@@ -25,7 +27,7 @@ import { LLM_PROVIDER_TOKEN, type LlmProvider } from "./llm/llm-provider";
 import { buildPrompt, type HistoryMessage } from "./prompt-builder";
 import { classifyQuestion } from "./question-classifier";
 import { RepositorySummaryService } from "./repository-summary.service";
-import { TokenUsageRepository } from "./token-usage.repository";
+import { TokenUsageRepository } from "../usage/token-usage.repository";
 
 export type ChatStreamEvent =
   | { event: "token"; data: ChatTokenEvent }
@@ -89,6 +91,7 @@ export class ChatService {
     @Inject(APP_CONFIG) private readonly config: AiEnv,
     @Inject(APP_LOGGER) private readonly logger: Logger,
     @Inject(LLM_PROVIDER_TOKEN) private readonly llm: LlmProvider,
+    @Inject(PROVIDER_METRICS) private readonly providerMetrics: ProviderMetrics,
     private readonly conversations: ChatConversationsRepository,
     private readonly messages: ChatMessagesRepository,
     private readonly tokenUsage: TokenUsageRepository,
@@ -209,11 +212,13 @@ export class ChatService {
         promptTokens: usage.promptTokens,
         completionTokens: usage.completionTokens,
       });
+      this.providerMetrics.chatLatencySeconds.observe((Date.now() - startedAt) / 1000);
 
       yield { event: "done", data: { messageId: assistantMessage.id } };
     } catch (err) {
       const appErr = err instanceof AppError ? err : new AppError("LLM_PROVIDER_ERROR", "Something went wrong while generating the answer.", { cause: err });
       this.logger.error({ err: appErr, conversationId: ctx.conversation.id, correlationId }, "chat stream failed");
+      this.providerMetrics.providerErrorsTotal.inc({ provider: this.config.LLM_PROVIDER, kind: appErr.code });
       yield { event: "error", data: { code: appErr.code, correlationId } };
     }
   }

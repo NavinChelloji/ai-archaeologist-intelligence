@@ -43,6 +43,8 @@ const AiEnvSchema = z.object({
   MAX_HISTORY_MESSAGES: z.coerce.number().int().positive().default(10),
   MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(2000),
   CHAT_QUOTA_TOKENS_PER_MONTH: z.coerce.number().int().positive().default(500000),
+  // Stage 10 — SCOPE_LIMITS.md "Cost Quotas".
+  QUOTA_EMBEDDING_TOKENS_PER_MONTH: z.coerce.number().int().positive().default(2000000),
 });
 
 export type AiEnv = z.infer<typeof AiEnvSchema>;
